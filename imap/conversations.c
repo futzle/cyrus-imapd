@@ -283,12 +283,54 @@ EXPORTED size_t conversations_estimate_emailcount(struct conversations_state *st
     return count;
 }
 
+static int conversations_lock(struct conversations_state *state, int shared)
+{
+    const char *val = NULL;
+    size_t vallen = 0;
+    int flags = shared ? CYRUSDB_SHARED : 0;
+
+    /* lock first! */
+    int r = cyrusdb_lock(state->db, &state->txn, flags);
+    if (r) return r;
+
+    /* load or initialize counted flags */
+    cyrusdb_fetch(state->db, CFKEY, strlen(CFKEY), &val, &vallen, &state->txn);
+    r = _init_counted(state, val, vallen);
+    if (r) return r;
+
+    /* we should just read the folder names up front too */
+    if (state->folder_names) strarray_truncate(state->folder_names, 0);
+    else state->folder_names = strarray_new();
+
+    /* if there's a value, parse as a dlist */
+    val = NULL;
+    vallen = 0;
+    cyrusdb_fetch(state->db, FNKEY, strlen(FNKEY), &val, &vallen, &state->txn);
+    if (vallen)
+        dlist_parsesax(val, vallen, 0, _saxfolder, state->folder_names);
+
+    free(state->annotmboxname);
+    if (state->userid)
+        state->annotmboxname = mboxname_user_mbox(state->userid, CONVSPLITFOLDER);
+    else
+        state->annotmboxname = xstrdup(CONVSPLITFOLDER);
+
+    free(state->trashmboxname);
+    char *trashmboxname = mboxname_user_mbox(state->userid, "Trash");
+    state->trashfolder = conversation_folder_number(state, trashmboxname, /*create*/0);
+    state->trashmboxname = trashmboxname;
+
+    /* create the status cache */
+    free_hash_table(&state->folderstatus, free);
+    construct_hash_table(&state->folderstatus, strarray_size(state->folder_names)/4+4, 0);
+
+    return 0;
+}
+
 EXPORTED int conversations_open_path(const char *fname, const char *userid, int shared,
                                      struct conversations_state **statep)
 {
     struct conversations_open *open = NULL;
-    const char *val = NULL;
-    size_t vallen = 0;
     int r = 0;
 
     if (!fname)
@@ -304,46 +346,23 @@ EXPORTED int conversations_open_path(const char *fname, const char *userid, int 
 
     /* open db */
     open->s.is_shared = shared;
-    int flags = CYRUSDB_CREATE | (shared ? (CYRUSDB_SHARED|CYRUSDB_NOCRC) : CYRUSDB_CONVERT);
-    r = cyrusdb_lockopen(DB, fname, flags, &open->s.db, &open->s.txn);
+    int flags = CYRUSDB_CREATE | (shared ? CYRUSDB_NOCRC : CYRUSDB_CONVERT);
+    r = cyrusdb_open(DB, fname, flags, &open->s.db);
     if (r || open->s.db == NULL) {
         free(open);
         return IMAP_IOERROR;
     }
     open->s.path = xstrdup(fname);
+    open->s.userid = xstrdupnull(userid);
     open->next = open_conversations;
     open_conversations = open;
 
-    /* load or initialize counted flags */
-    cyrusdb_fetch(open->s.db, CFKEY, strlen(CFKEY), &val, &vallen, &open->s.txn);
-    r = _init_counted(&open->s, val, vallen);
+    r = conversations_lock(&open->s, shared);
     if (r) {
         cyrusdb_abort(open->s.db, open->s.txn);
         _conv_remove(&open->s);
         return r;
     }
-
-    /* we should just read the folder names up front too */
-    open->s.folder_names = strarray_new();
-
-    /* if there's a value, parse as a dlist */
-    vallen = 0;
-    cyrusdb_fetch(open->s.db, FNKEY, strlen(FNKEY), &val, &vallen, &open->s.txn);
-    if (vallen) {
-        dlist_parsesax(val, vallen, 0, _saxfolder, open->s.folder_names);
-    }
-
-    if (userid)
-        open->s.annotmboxname = mboxname_user_mbox(userid, CONVSPLITFOLDER);
-    else
-        open->s.annotmboxname = xstrdup(CONVSPLITFOLDER);
-
-    char *trashmboxname = mboxname_user_mbox(userid, "Trash");
-    open->s.trashfolder = conversation_folder_number(&open->s, trashmboxname, /*create*/0);
-    open->s.trashmboxname = trashmboxname;
-
-    /* create the status cache */
-    construct_hash_table(&open->s.folderstatus, strarray_size(open->s.folder_names)/4+4, 0);
 
     *statep = &open->s;
 

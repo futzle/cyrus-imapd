@@ -86,6 +86,7 @@ struct conv_quota {
 struct conversations_state {
     struct db *db;
     struct txn *txn;
+    char *userid;
     char *annotmboxname;
     strarray_t *counted_flags;
     strarray_t *folder_names;
